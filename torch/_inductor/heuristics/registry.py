@@ -11,6 +11,7 @@ Both share one underlying registry dict and cascading fallback lookup.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 from typing import Any, TYPE_CHECKING
 
@@ -201,9 +202,7 @@ def get_codegen_heuristic(name: str, device_type: str) -> CodegenConfigHeuristic
     heuristic_class = _lookup(name, device_type, None)
 
     if heuristic_class is None:
-        # Lazily import codegen heuristics to trigger registration
-        import torch._inductor.heuristics.triton_codegen  # noqa: F401
-
+        importlib.import_module("torch._inductor.heuristics.triton_codegen")
         heuristic_class = _lookup(name, device_type, None)
 
     if heuristic_class is None:

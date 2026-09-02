@@ -10,14 +10,17 @@ with name-based keys (e.g., "pointwise").
 
 from __future__ import annotations
 
+import importlib
+
 from torch._inductor.heuristics.registry import (
     CodegenConfigHeuristics,
     get_codegen_heuristic,
     register_codegen_heuristic,
 )
 
-# Import submodules to trigger registration
-from . import pointwise as pointwise, reduction as reduction
+# These imports must be eager because registration happens as a module side effect.
+pointwise = importlib.import_module(f"{__name__}.pointwise")
+reduction = importlib.import_module(f"{__name__}.reduction")
 
 
 __all__ = [

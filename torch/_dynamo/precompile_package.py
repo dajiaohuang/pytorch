@@ -102,9 +102,9 @@ artifacts transparently without an explicit capture block.
 
 from __future__ import annotations
 
-import ast
 import collections
 import contextlib
+import dataclasses
 import copy
 import functools
 import hashlib
@@ -225,6 +225,33 @@ def _clear_package_region(
 
     for code in codes:
         _clear_cache_entries_for_region(code, isolate_recompiles_id)
+
+
+def _compose_with_default(
+    user: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]],
+) -> Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]:
+    """AND a caller's filter with the default rather than replacing it.
+
+    ``default_guard_filter_fn`` is not a default in the "sensible starting point"
+    sense -- it is what drops the identity guards that CANNOT be serialized at
+    all. Replacing it means a caller who wanted to drop three of their own guards
+    silently re-admits every unserializable one, and the failure surfaces as
+    "ID_MATCH guard cannot be serialized" in frames that have nothing to do with
+    their filter. A custom filter can only ever want to drop MORE, so composing
+    is the only reading that makes sense.
+    """
+
+    def composed(entries: Sequence[GuardFilterEntry]) -> Sequence[bool]:
+        base = default_guard_filter_fn(entries)
+        chosen = user(entries)
+        if len(chosen) != len(entries):
+            raise ValueError(
+                f"guard_filter_fn returned {len(chosen)} decisions for "
+                f"{len(entries)} guards; it must return one per entry."
+            )
+        return [bool(a) and bool(b) for a, b in zip(base, chosen)]
+
+    return composed
 
 
 def default_guard_filter_fn(
@@ -1059,15 +1086,6 @@ def _object_identity(value: object) -> str:
     return f"is a {type(value).__module__}.{type(value).__qualname__}"[:160]
 
 
-# Guards that pin which BRANCH the traced code took on a data-dependent
-# condition: whether an attribute or key is THERE, what class a value has,
-# whether it is None or which bool it is, how long an iterator runs, and the
-# process state autograd dispatch reads. A branch guard is a CONSTANT_MATCH by
-# another name -- dropped, the captured side is served to a caller on the other
-# one -- and reachable on the DEFAULT gates, because a single-variant capture
-# makes every slot look invariant and a policy drop is not classed risky.
-# TYPE_MATCH is also what upstream leans on to make the relaxed
-# AsyncCollectiveTensor class guards sound, so it must never go.
 # Guards that pin an input's SHAPE or VALUE. Never policy-dropped, and named
 # ahead of the rest in the risky-drop report: an out-of-domain shape reaches a
 # kernel specialized for a different one, which crashes on inductor and can
@@ -1085,6 +1103,7 @@ _SHAPE_BEARING_GUARD_TYPES = frozenset(
         "DUPLICATE_INPUT",
     }
 )
+
 
 _BRANCH_PINNING_GUARD_TYPES = frozenset(
     {
@@ -1112,11 +1131,12 @@ _BRANCH_PINNING_GUARD_TYPES = frozenset(
 )
 
 # Guard types the invariant policy NEVER drops, however identically they held
-# across the captured variants: guards that pin a data-dependent branch. Dropping
+# across the captured variants. Two classes are admitted: guards that pin an
+# input's shape or value, and guards that pin a data-dependent branch. Dropping
 # a guard is licensed by "it discriminated nothing", but with a single example
 # nothing CAN discriminate, and what would silently disappear is the check that
 # the served call looks like the captured one at all.
-_NEVER_DROPPED_GUARD_TYPES = _BRANCH_PINNING_GUARD_TYPES
+_NEVER_DROPPED_GUARD_TYPES = _SHAPE_BEARING_GUARD_TYPES | _BRANCH_PINNING_GUARD_TYPES
 
 # Guard types several of which can sit on ONE source -- hasattr(cfg, "a") and
 # hasattr(cfg, "b") are both ("HASATTR", "cfg") -- so their slot carries the
@@ -1362,6 +1382,7 @@ def _summarize(
     uncovered: frozenset[str],
     capture_errors: Sequence[str],
     guard_sets: Mapping[tuple[str, str, int], Sequence[frozenset[_GuardFact]]],
+    unrendered: Mapping[str, str] = {},
 ) -> PrecompileSummary:
     wont_generalize = _wont_generalize(kept, guard_sets)
     return PrecompileSummary(
@@ -1378,81 +1399,8 @@ def _summarize(
         risky_dropped_guards=tuple(sorted(risky)),
         policy_dropped_guards=tuple(sorted(policy_dropped)),
         capture_errors=tuple(capture_errors),
+        unrendered_backends=tuple(sorted(unrendered.items())),
     )
-
-
-def _namespace_module_names(rendered: dict[str, str]) -> dict[str, str]:
-    """Suffix every top-level name a rendered subgraph DEFINES, per subgraph.
-
-    The blocks are spliced sequentially into ONE namespace, and their code
-    resolves siblings as late-bound globals: a block's ``call`` looks up
-    ``_runtime_wrapper`` and ``_inner_call`` when invoked, and its ``Runner``
-    looks up the Triton kernels. Two variants of one frame are the same
-    computation at different shapes, so they define the SAME names -- without
-    renaming, the first variant silently runs the second variant's code.
-    Snapshotting ``call`` after each block is not enough, because what a block
-    resolves is decided at call time, not at definition time.
-
-    Rewriting is driven by AST positions rather than a text match, which is what
-    keeps three lookalikes out of it: an attribute (``runner.call`` is an
-    ``Attribute``, not a ``Name``), a nested binding (``def call`` inside
-    ``class Runner`` is not module-level), and an import (``async_compile`` is
-    both a local binding and part of ``torch._inductor.async_compile``).
-    """
-    out: dict[str, str] = {}
-    for slot, (backend_id, source) in enumerate(rendered.items()):
-        tree = ast.parse(source)
-        imported: set[str] = set()
-        defined: set[str] = set()
-        headers: list[tuple[int, str]] = []
-        for node in tree.body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    imported.add((alias.asname or alias.name).split(".")[0])
-            elif isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                defined.add(node.name)
-                headers.append((node.lineno, node.name))
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        defined.add(target.id)
-            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-                defined.add(node.target.id)
-        targets = defined - imported
-        if not targets:
-            out[backend_id] = source
-            continue
-
-        suffix = f"_s{slot}"
-        edits: dict[int, list[tuple[int, int, str]]] = {}
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Name)
-                and node.id in targets
-                and node.end_col_offset is not None
-            ):
-                edits.setdefault(node.lineno, []).append(
-                    (node.col_offset, node.end_col_offset, node.id + suffix)
-                )
-        lines = source.split("\n")
-        for lineno, name in headers:
-            if name not in targets:
-                continue
-            line = lines[lineno - 1]
-            col = re.search(rf"\b{re.escape(name)}\b", line)
-            if col is not None:
-                edits.setdefault(lineno, []).append(
-                    (col.start(), col.end(), name + suffix)
-                )
-        for lineno, spans in edits.items():
-            line = lines[lineno - 1]
-            for begin, finish, text in sorted(spans, reverse=True):
-                line = line[:begin] + text + line[finish:]
-            lines[lineno - 1] = line
-        out[backend_id] = "\n".join(lines)
-    return out
 
 
 class PrecompileSession:
@@ -1472,7 +1420,6 @@ class PrecompileSession:
         dynamic: bool | None = None,
         example_inputs: Sequence[ExampleInput | tuple[object, ...]] | None = None,
         invariants: str | None = None,
-        keep_only: frozenset[tuple[str, str]] | None = None,
         training: bool = False,
     ) -> None:
         # Not `example_inputs or ()`: truth-testing the caller's object turns the
@@ -1499,10 +1446,10 @@ class PrecompileSession:
         self._fn = fn
         self._backend = backend
         self._custom_guard_filter = guard_filter_fn is not None
-        # The guard slots that DID vary across the capture; every other slot is
-        # dropped. None means serialize everything serializable, which only the
-        # internal capture entry point uses -- precompile() always passes a set.
-        self._keep_only: frozenset[tuple[str, str]] | None = keep_only
+        # Drop, on exit, every guard slot whose value was identical in every
+        # variant of every frame. Off by default: the capture session API
+        # serializes everything serializable, and precompile() turns it on.
+        self._prune_invariant_guards = False
         # The grad mode each variant compiled under; the artifact dispatches
         # under it, since GRAD_MODE is a guard a call in the other mode misses.
         self._compile_grad_modes: set[bool] = set()
@@ -1515,6 +1462,9 @@ class PrecompileSession:
         self._keep_graphs = False
         self._backend_obj: _PrecompileBackend | None = None
         self._policy_dropped_guards: set[tuple[str, str]] = set()
+        # backend id -> why its subgraph could not be composed to source and so
+        # ships only in the pickled bundle; see rendered_backends.
+        self._unrendered_backends: dict[str, str] = {}
         self._dropped_guards: set[tuple[str, str]] = set()
         self._kept_guards: set[tuple[str, str]] = set()
         self._risky_dropped_guards: set[tuple[str, str]] = set()
@@ -1524,7 +1474,9 @@ class PrecompileSession:
         self._guard_sets: dict[tuple[str, str, int], list[frozenset[_GuardFact]]] = {}
         self._undetermined: dict[tuple[str, str, int], set[_GuardFact]] = {}
         self._guard_filter_fn = self._recording_filter(
-            default_guard_filter_fn if guard_filter_fn is None else guard_filter_fn
+            default_guard_filter_fn
+            if guard_filter_fn is None
+            else _compose_with_default(guard_filter_fn)
         )
         self._recompile_limit = recompile_limit
         self._dynamic = dynamic
@@ -1764,6 +1716,9 @@ class PrecompileSession:
                     with self._state:
                         self._state.notify_all()
         self._recorded_exception_keys.clear()
+        # Before the report, so that it describes the artifact actually written.
+        if self._prune_invariant_guards and exc[0] is None:
+            self._apply_guard_policy()
         if self._invariants_path is None:
             return
         if exc[0] is None:
@@ -1779,6 +1734,103 @@ class PrecompileSession:
                 getattr(exc[0], "__name__", exc[0]),
                 self._invariants_path,
             )
+
+    def _apply_guard_policy(self) -> None:
+        """
+        Drop every guard slot whose fact was identical in every variant of every
+        frame. Such a slot discriminates nothing, and most of an artifact's
+        guards are of that kind: on a 62-frame ranking model, 738 of 1207 slots.
+
+        Which slots those are is only knowable once every variant exists, but
+        guards are serialized per compilation, as each one is produced. So the
+        policy is applied afterwards, by re-serializing each frame's guards from
+        the pickle the capture already made. The pickle rather than the live
+        guards: it IS the value snapshot taken at compile time, and a guarded
+        attribute that the model mutates has moved on since.
+        """
+        from torch._dynamo.guards import CheckFunctionManager
+        from torch._dynamo.output_graph import OutputGraphCommon
+        from torch._dynamo.package import load_guards_state, SerializedCode
+
+        keep_only = varying_guard_slots(self._guard_sets)
+        dropped: set[tuple[str, str]] = set()
+
+        def survives(guard_type: str, name: str, derived: Sequence[str] = ()) -> bool:
+            # An unmodelled guard never enters _guard_sets, so it was never
+            # shown to be constant -- only never analyzed. This policy drops
+            # what it PROVED invariant, so these stay. SHAPE_ENV is the one
+            # that matters: it carries symbolic shape constraints that no
+            # TENSOR_MATCH repeats.
+            #
+            # The DERIVED types decide too. One Guard can emit several checks --
+            # a DICT_KEYS_MATCH emits the SEQUENCE_LENGTH for the same dict --
+            # and the filter removes whole Guards, so judging only the
+            # top-level type takes the length check down with its parent and
+            # the artifact answers a four-key dict with the two-key graph.
+            protected = _UNMODELLED_GUARD_TYPES | _NEVER_DROPPED_GUARD_TYPES
+            return (
+                guard_type in protected
+                or any(d in protected for d in derived)
+                or (guard_type, _normalize(name)) in keep_only
+            )
+
+        def policy(entries: Sequence[GuardFilterEntry]) -> Sequence[bool]:
+            decisions = []
+            for entry in entries:
+                slot = _guard_slot(entry.orig_guard)
+                keep = survives(slot[0], slot[1], entry.derived_guard_types)
+                if not keep:
+                    dropped.add(slot)
+                decisions.append(keep)
+            return decisions
+
+        for code_entry in self._package.code_entries():
+            # A bypassed frame has no guards to re-serialize.
+            f_code = None
+            for guarded in code_entry.guarded_codes:
+                if f_code is None:
+                    f_code = SerializedCode.to_code_object(code_entry.python_code)
+                loaded = load_guards_state(guarded.guards_state)
+                try:
+                    pruned = CheckFunctionManager(
+                        f_code,
+                        OutputGraphCommon(loaded.output_graph),
+                        shape_code_parts=loaded.shape_code_parts,
+                        runtime_global_scope=None,
+                        guard_build_local_state=getattr(loaded, "local_state", None),
+                        save_guards=True,
+                        # The pickle holds only guards that already survived the
+                        # default and user filters, so the policy is the whole
+                        # filter here; and a failure is an internal bug, not
+                        # something to bypass silently.
+                        serialization_guard_filter_fn=policy,
+                        strict_error=True,
+                    ).guards_state
+                    if pruned is None:
+                        raise AssertionError("save_guards produced no guards_state")
+                except Exception as e:
+                    raise PackageError(
+                        f"precompile: could not re-serialize the guards of "
+                        f"{code_entry.python_code.co_name} while dropping "
+                        f"invariant ones: {type(e).__name__}: {e}"
+                    ) from e
+                guarded.guards_state = pruned
+
+        self._policy_dropped_guards |= dropped
+        # Not "risky": the policy is the caller stating that the environment is
+        # fixed and every variation is in the inputs, so a slot that never
+        # varied is out of the artifact's declared domain rather than an
+        # unchecked hazard.
+        self._kept_guards -= dropped
+        for key, variants in self._guard_sets.items():
+            self._guard_sets[key] = [
+                frozenset(
+                    f
+                    for f in facts
+                    if not f.enforced or survives(f.guard_type, f.source)
+                )
+                for facts in variants
+            ]
 
     def _recording_filter(
         self,
@@ -1800,47 +1852,10 @@ class PrecompileSession:
             decisions = inner(entries)
             self._compile_grad_modes.add(torch.is_grad_enabled())
             namespaces = _module_namespaces(entries)
-            # A slot whose fact was identical in every variant of every frame
-            # discriminates nothing, so it is not serialized. Recorded apart
-            # from the ordinary drops, which are "could not be serialized";
-            # these could, and were not wanted.
-            policy_dropped: set[int] = set()
-            if self._keep_only is not None:
-                for i, entry in enumerate(entries):
-                    # An unmodelled guard never enters _guard_sets, so it was
-                    # never shown to be constant -- only never analyzed. This
-                    # policy drops what it PROVED invariant, so these stay.
-                    # SHAPE_ENV is the one that matters: it carries symbolic
-                    # shape constraints that no TENSOR_MATCH repeats.
-                    # A guard that pins a branch is never dropped either: with
-                    # one variant nothing CAN vary, and dropping it serves the
-                    # captured side to a caller on the other. The DERIVED types
-                    # decide too, since one Guard can emit several checks.
-                    protected = _UNMODELLED_GUARD_TYPES | _NEVER_DROPPED_GUARD_TYPES
-                    if entry.guard_type in protected or any(
-                        d in protected for d in entry.derived_guard_types
-                    ):
-                        continue
-                    slot_type, slot_name = _guard_slot(entry.orig_guard)
-                    if (
-                        decisions[i]
-                        and (slot_type, _normalize(slot_name)) not in self._keep_only
-                    ):
-                        policy_dropped.add(i)
-                decisions = [
-                    keep and i not in policy_dropped for i, keep in enumerate(decisions)
-                ]
             facts: set[_GuardFact] = set()
             undetermined: set[_GuardFact] = set()
-            for i, (keep, entry) in enumerate(zip(decisions, entries)):
+            for keep, entry in zip(decisions, entries):
                 slot = _guard_slot(entry.orig_guard)
-                if i in policy_dropped:
-                    # Not "risky": the policy is the caller stating that the
-                    # environment is fixed and every variation is in the inputs,
-                    # so a slot that never varied is out of the artifact's
-                    # declared domain rather than an unchecked hazard.
-                    self._policy_dropped_guards.add(slot)
-                    continue
                 target = self._kept_guards if keep else self._dropped_guards
                 target.add(slot)
                 if not keep and (
@@ -2035,6 +2050,7 @@ class PrecompileSession:
             self._package.uncovered_frames,
             self._capture_errors,
             self._guard_sets,
+            unrendered=self._unrendered_backends,
         )
 
     def _gated_summary(
@@ -2271,7 +2287,10 @@ class PrecompileSession:
         output, which has a source form (the make_fx tracer emits exactly this),
         unlike the guard trees and transformed bytecode beside it. Anything that
         fails to render -- a training graph, an effectful op, a graph with no
-        compute -- is simply absent here and stays pickled.
+        compute -- is absent here and stays pickled, warned about once and
+        listed in ``summary().unrendered_backends``, because a training
+        artifact that quietly falls back to the bundle is not the readable one
+        the caller asked for.
 
         Rendering re-runs AOTAutograd + Inductor on the retained graph, so it is
         a second lowering, paid once per subgraph that reaches the artifact.
@@ -2280,13 +2299,6 @@ class PrecompileSession:
 
         if self._backend_obj is None or self._backend == "eager":
             return {}
-        if self._training:
-            # compile_to_python pins AOTAutograd to the INFERENCE path, so a
-            # training graph renders as a forward with the backward silently
-            # dropped -- the served output would lose its grad_fn. That is a
-            # wrong answer rather than a failed render, so it cannot be left to
-            # the except below; refuse up front and keep the bundle.
-            return {}
         rendered: dict[str, str] = {}
         for backend_id in backend_ids:
             held = self._backend_obj.graphs.get(str(backend_id))
@@ -2294,12 +2306,30 @@ class PrecompileSession:
                 continue
             gm, fakes = held
             try:
-                source, _ = aot_autograd.compile_to_python(gm, fakes)
+                # grad_enabled is what makes AOTAutograd emit the joint
+                # forward+backward for a training capture; without it the
+                # backward is silently absent and the served output loses its
+                # grad_fn.
+                source, _ = aot_autograd.compile_to_python(
+                    gm, fakes, grad_enabled=self._training
+                )
             except Exception as e:
-                log.debug("precompile: %s stays pickled (%s)", backend_id, e)
+                reason = f"{type(e).__name__}: {e}"
+                self._unrendered_backends[str(backend_id)] = reason
+                log.warning(
+                    "precompile: subgraph %s could not be composed to source "
+                    "and stays pickled (%s)",
+                    backend_id,
+                    reason,
+                )
                 continue
             rendered[str(backend_id)] = source
-        return _namespace_module_names(rendered)
+        from torch._functorch._aot_autograd.to_standalone_python import (
+            namespace_module_names,
+        )
+
+        keys = list(rendered)
+        return dict(zip(keys, namespace_module_names([rendered[k] for k in keys])))
 
     def _collect_backends(self) -> dict[str, Any]:
         """The compiled subgraphs this capture produced, keyed by backend id."""
@@ -2358,15 +2388,22 @@ class PrecompileSession:
 
         entry = self._package.cache_entry()
         backends = self._collect_backends()
+        rendered = self.rendered_backends(list(backends))
         return _build_multigraph_artifact(
             entry,
             backends,
-            summary,
+            self._with_unrendered(summary),
             self._backend,
             _entry_fn_of(self._fn),
-            self.rendered_backends(list(backends)),
+            rendered,
             grad_enabled=self._capture_grad_mode(),
         )
+
+    def _with_unrendered(self, summary: PrecompileSummary) -> PrecompileSummary:
+        # Rendering runs after the gates, so the gated summary predates what
+        # rendered_backends learned; the header must describe the file written.
+        unrendered = tuple(sorted(self._unrendered_backends.items()))
+        return dataclasses.replace(summary, unrendered_backends=unrendered)
 
 
 class _SingleFileStore(DynamoStore):
@@ -2548,7 +2585,6 @@ def precompile_capture(
     dynamic: bool | None = None,
     example_inputs: Sequence[ExampleInput | tuple[object, ...]] | None = None,
     invariants: str | None = None,
-    keep_only: frozenset[tuple[str, str]] | None = None,
     training: bool = False,
 ) -> PrecompileSession:
     r"""Begin capturing ``fn`` into a multi-graph artifact.
@@ -2581,7 +2617,6 @@ def precompile_capture(
         dynamic=dynamic,
         example_inputs=example_inputs,
         invariants=invariants,
-        keep_only=keep_only,
         training=training,
     )
 

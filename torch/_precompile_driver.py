@@ -740,19 +740,52 @@ def _build_installed_forward():
     """
     import base64
     import importlib
+    import os as _os
     import pickle
     import sys
     import types
 
     from torch._dynamo.package import SerializedCode
-    from torch._precompile import _InstalledArtifact
+    from torch._precompile import _InstalledArtifact, PrecompileError
 
     cache_entry = pickle.loads(base64.b64decode(_PACKAGE))
 
     # install resolves every frame through sys.modules[...] directly, so each
     # module a captured frame came from has to be imported before it runs.
     for _code_entry in cache_entry.dynamo.codes:
-        importlib.import_module(_code_entry.python_module)
+        try:
+            _module = importlib.import_module(_code_entry.python_module)
+        except ImportError as e:
+            raise PrecompileError(
+                f"precompile: the captured frame "
+                f"{_code_entry.python_code.co_name!r} lives in module "
+                f"{_code_entry.python_module!r}, which cannot be imported here "
+                f"({e}). Make it importable on the loading machine, or recapture "
+                f"from an importable module."
+            ) from e
+        if _code_entry.python_module == "__main__":
+            # See the standalone driver: __main__ is whichever script is
+            # running, so only the script the frame was compiled from can
+            # serve it.
+            _captured = _code_entry.python_code.co_filename
+            _running = getattr(_module, "__file__", None)
+            # Compared only when both name a real file: a REPL, `python -c` or
+            # a notebook has no __file__, and a frame compiled there records a
+            # placeholder co_filename, so neither can identify another script.
+            if (
+                _running is not None
+                and _os.path.isfile(_running)
+                and _os.path.isfile(_captured)
+                and _os.path.realpath(_running) != _os.path.realpath(_captured)
+            ):
+                raise PrecompileError(
+                    f"precompile: the captured frame "
+                    f"{_code_entry.python_code.co_name!r} was compiled in "
+                    f"__main__ ({_captured}), and this process's __main__ is "
+                    f"{_running}; installing it would bind another script's "
+                    f"globals. Capture from a function defined in an importable "
+                    f"module."
+                )
 
     def _entry_function():
         # The entry records no qualname to resolve -- it is the callable handed

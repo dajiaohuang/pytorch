@@ -11,6 +11,7 @@ from a different process or host.
 import abc
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
 import hashlib
@@ -106,6 +107,78 @@ class _GlobalBinding:
 # still serving and still reads that name from this module. Deleting is only
 # right when the stack empties.
 _GLOBAL_BINDINGS: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+class _RegionInstall:
+    """
+    The precompile-entry state install() writes into a region, kept off the
+    package so a finalizer can release it after the package is gone.
+
+    ``owner`` is stamped onto every precompile entry the package installs, so
+    release() removes exactly those and leaves a neighbour package's entries on
+    a shared code object alone. ``codes`` covers resume functions and any frame
+    reached through code_source, not just the entry frame; code_context() adds
+    the live frames an uncovered call compiled inside the region.
+    """
+
+    def __init__(self) -> None:
+        self.owner = object()
+        self.region_id = -1
+        self.codes: list[types.CodeType] = []
+        self.skipped_codes: list[types.CodeType] = []
+
+    def release(self) -> None:
+        from torch._C._dynamo.eval_frame import (
+            _reset_precompile_entries_for_owner,
+            set_code_region_exec_strategy,
+        )
+
+        with _PACKAGE_INSTALL_LOCK:
+            if self.skipped_codes:
+                default_strategy = FrameExecStrategy(
+                    FrameAction.DEFAULT, FrameAction.DEFAULT
+                )
+                for code in self.skipped_codes:
+                    set_code_region_exec_strategy(
+                        code, self.region_id, default_strategy
+                    )
+                self.skipped_codes.clear()
+            for code in self.codes:
+                _reset_precompile_entries_for_owner(code, self.region_id, self.owner)
+            self.codes.clear()
+            self.region_id = -1
+
+
+# (source id, isolate_recompiles_id) -> the package serving that function under
+# caching_precompile. Re-wrapping a function joins this package instead of
+# loading and installing the artifact again, which stacked one precompile entry
+# per wrap on the code object. Weak, so the entries go with the last wrapper.
+_LIVE_PACKAGES: "weakref.WeakValueDictionary[tuple[str, int], CompilePackage]" = (
+    weakref.WeakValueDictionary()
+)
+_LIVE_PACKAGES_LOCK = threading.Lock()
+
+
+def live_package(
+    fn: Callable[..., Any], isolate_recompiles_id: int
+) -> "CompilePackage | None":
+    key = (CompilePackage.source_id_from_fn(fn), isolate_recompiles_id)
+    with _LIVE_PACKAGES_LOCK:
+        return _LIVE_PACKAGES.get(key)
+
+
+def register_live_package(
+    package: "CompilePackage", isolate_recompiles_id: int
+) -> None:
+    with _LIVE_PACKAGES_LOCK:
+        _LIVE_PACKAGES[(package.source_id, isolate_recompiles_id)] = package
+
+
+def reset_live_packages() -> None:
+    """torch._dynamo.reset() cleared the entries these packages installed, so a
+    later wrap must load the artifact afresh rather than join them."""
+    with _LIVE_PACKAGES_LOCK:
+        _LIVE_PACKAGES.clear()
 
 
 def _code_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -392,7 +465,9 @@ def _resume_global_renames(
     processes, or one artifact loaded twice to serve two model instances --
     and both then hash to a single name. The token, unique to the loaded
     package, is what separates those; the digest stays so the name still says
-    which code it belongs to.
+    which code it belongs to. It hashes the bytecode and the name tables only:
+    pickling the whole SerializedCode is not reproducible across processes
+    (frozenset constants pickle in hash order).
     """
     renames: dict[str, str] = {}
     for entry in entries:
@@ -623,44 +698,6 @@ def _get_code_source(code: types.CodeType) -> tuple[str, str]:
 _CpuCodegenTarget = tuple[str, str, str | None, str, int | None, str | None]
 
 
-def _cpu_codegen_config() -> tuple[str | None, int | None, str | None]:
-    """The process-mutable inputs of the codegen target, cheap to read."""
-    from torch._inductor import config as inductor_config
-
-    return (
-        os.environ.get("ATEN_CPU_CAPABILITY"),
-        inductor_config.cpp.simdlen,
-        inductor_config.cpp.march,
-    )
-
-
-# Registered backends that generate no native code, so an artifact of theirs
-# has no baked vector width to protect and must not be gated on one. This is a
-# blacklist on purpose: anything unrecognised -- including a user's own
-# callable, whose compiler_name is just its __name__ -- is assumed to emit
-# code, because a false rejection at load is recoverable and silently running a
-# kernel built for another ISA is not.
-_NO_NATIVE_CODE_BACKENDS = frozenset(
-    {
-        "aot_eager",
-        "aot_eager_decomp_partition",
-        "aot_eager_decomp_partition_crossref",
-        "aot_eager_decomp_partition_with_mode",
-        "aot_eager_default_partitioner",
-        "aot_ts",
-        "cudagraphs",
-        "eager",
-        "eager_debug",
-        "eager_noexcept",
-        "non_leaf_compile_error_TESTING_ONLY",
-        "pre_dispatch_eager",
-        "relu_accuracy_error_TESTING_ONLY",
-        "relu_compile_error_TESTING_ONLY",
-        "relu_runtime_error_TESTING_ONLY",
-        "ts",
-    }
-)
-
 def _current_cpu_codegen_target() -> _CpuCodegenTarget | None:
     """The vector-width inputs inductor bakes into generated CPU code.
 
@@ -671,7 +708,6 @@ def _current_cpu_codegen_target() -> _CpuCodegenTarget | None:
     have produced nor be about to run an inductor CPU kernel, so there is no
     baked vector width to protect.
     """
-    from torch._inductor import config as inductor_config
     from torch._inductor.cpu_vec_isa import pick_vec_isa
 
     try:
@@ -684,11 +720,23 @@ def _current_cpu_codegen_target() -> _CpuCodegenTarget | None:
         )
         return None
 
+    env, simdlen, march = _cpu_codegen_config()
     return (
         platform.machine(),
         torch.backends.cpu.get_cpu_capability(),
-        os.environ.get("ATEN_CPU_CAPABILITY"),
+        env,
         vec_isa,
+        simdlen,
+        march,
+    )
+
+
+def _cpu_codegen_config() -> tuple[str | None, int | None, str | None]:
+    """The process-mutable inputs of the codegen target, cheap to read."""
+    from torch._inductor import config as inductor_config
+
+    return (
+        os.environ.get("ATEN_CPU_CAPABILITY"),
         inductor_config.cpp.simdlen,
         inductor_config.cpp.march,
     )
@@ -872,10 +920,8 @@ class _DynamoCacheEntry:
 
     def check_versions(self) -> None:
         """Check if the current system is compatible with the system used to create this cache entry."""
-        device_types = getattr(self, "device_types", None) or frozenset(
-            (self.device_type,)
-        )
-        check_codegen = getattr(self, "requires_native_backend_compatibility", True)
+        device_types = self.device_types or frozenset((self.device_type,))
+        check_codegen = self.requires_native_backend_compatibility
         # Determining the codegen target runs the C++ toolchain, so only pay for
         # it when this artifact actually records one to compare against.
         current_system_info = SystemInfo.current(
@@ -900,9 +946,7 @@ class _DynamoCacheEntry:
             "fn_name": self.fn_name,
             "fn_first_lineno": self.fn_first_lineno,
             "device_type": self.device_type,
-            "device_types": sorted(
-                getattr(self, "device_types", None) or frozenset((self.device_type,))
-            ),
+            "device_types": sorted(self.device_types or frozenset((self.device_type,))),
             "backend_ids": list(self.backend_ids),
         }
 
@@ -1022,78 +1066,6 @@ def _compile_frame_context(
     return _ctx()
 
 
-class _RegionInstall:
-    """
-    The precompile-entry state install() writes into a region, kept off the
-    package so a finalizer can release it after the package is gone.
-
-    ``owner`` is stamped onto every precompile entry the package installs, so
-    release() removes exactly those and leaves a neighbour package's entries on
-    a shared code object alone. ``codes`` covers resume functions and any frame
-    reached through code_source, not just the entry frame; code_context() adds
-    the live frames an uncovered call compiled inside the region.
-    """
-
-    def __init__(self) -> None:
-        self.owner = object()
-        self.region_id = -1
-        self.codes: list[types.CodeType] = []
-        self.skipped_codes: list[types.CodeType] = []
-
-    def release(self) -> None:
-        from torch._C._dynamo.eval_frame import (
-            _reset_precompile_entries_for_owner,
-            set_code_region_exec_strategy,
-        )
-
-        with _PACKAGE_INSTALL_LOCK:
-            if self.skipped_codes:
-                default_strategy = FrameExecStrategy(
-                    FrameAction.DEFAULT, FrameAction.DEFAULT
-                )
-                for code in self.skipped_codes:
-                    set_code_region_exec_strategy(
-                        code, self.region_id, default_strategy
-                    )
-                self.skipped_codes.clear()
-            for code in self.codes:
-                _reset_precompile_entries_for_owner(code, self.region_id, self.owner)
-            self.codes.clear()
-            self.region_id = -1
-
-
-# (source id, isolate_recompiles_id) -> the package serving that function under
-# caching_precompile. Re-wrapping a function joins this package instead of
-# loading and installing the artifact again, which stacked one precompile entry
-# per wrap on the code object. Weak, so the entries go with the last wrapper.
-_LIVE_PACKAGES: "weakref.WeakValueDictionary[tuple[str, int], CompilePackage]" = (
-    weakref.WeakValueDictionary()
-)
-_LIVE_PACKAGES_LOCK = threading.Lock()
-
-
-def live_package(
-    fn: Callable[..., Any], isolate_recompiles_id: int
-) -> "CompilePackage | None":
-    key = (CompilePackage.source_id_from_fn(fn), isolate_recompiles_id)
-    with _LIVE_PACKAGES_LOCK:
-        return _LIVE_PACKAGES.get(key)
-
-
-def register_live_package(
-    package: "CompilePackage", isolate_recompiles_id: int
-) -> None:
-    with _LIVE_PACKAGES_LOCK:
-        _LIVE_PACKAGES[(package.source_id, isolate_recompiles_id)] = package
-
-
-def reset_live_packages() -> None:
-    """torch._dynamo.reset() cleared the entries these packages installed, so a
-    later wrap must load the artifact afresh rather than join them."""
-    with _LIVE_PACKAGES_LOCK:
-        _LIVE_PACKAGES.clear()
-
-
 class CompilePackage:
     """
     CompilePackage is considered a low level component and should not be directly exposed to
@@ -1149,10 +1121,11 @@ class CompilePackage:
         # distinct from resume code that was generated but never executed.
         self._uncovered_frames: set[str] = set()
         self._device_types: set[str] = set()
-        # Probed once per package: the toolchain probe costs seconds.
-        self._cpu_codegen_probed = False
-        self.variants_dropped_for_codegen_target = 0
         self._system_info: SystemInfo | None = None
+        self._cpu_codegen_probed = False
+        # Variants compiled after inductor's CPU codegen config moved away from
+        # the recorded target. They are left out of the artifact.
+        self.variants_dropped_for_codegen_target = 0
         self._default_requires_native_backend_compatibility = (
             requires_native_backend_compatibility
         )
@@ -1207,11 +1180,17 @@ class CompilePackage:
         if self._innermost_fn is None:
             raise AssertionError("innermost_fn returned None")
         if dynamo is not None:
+            # self._codes binds the entry's own per-code records and a later
+            # recompile appends to them, so a caller that keeps the entry (a
+            # store, or a second serve of one artifact) would see the new
+            # backend ids written back into it. bytes are atomic to deepcopy,
+            # so this copies the record structure, not the guard payloads.
             if not isinstance(dynamo, _DynamoCacheEntry):
                 raise AssertionError(f"Expected _DynamoCacheEntry, got {type(dynamo)}")
-            dynamo.check_versions()
+            entry = copy.deepcopy(dynamo)
+            entry.check_versions()
             if not ignore_inlined_sources:
-                for code in dynamo.source_info.inlined_sources:
+                for code in entry.source_info.inlined_sources:
                     m = importlib.import_module(code.module)
                     checksum = _hash_sourcelines(m, code.firstlineno, code.lastlineno)
                     if checksum != code.checksum:
@@ -1219,21 +1198,19 @@ class CompilePackage:
                             f"Source code changes detected for {code.module} (line {code.firstlineno} - line {code.lastlineno})"
                         )
 
-                self._source_info = dynamo.source_info
+                self._source_info = entry.source_info
 
-            main, *codes = dynamo.codes
+            main, *codes = entry.codes
             self._codes = {self._innermost_fn.__code__: main}
             for code in codes:
                 self._codes[SerializedCode.to_code_object(code.python_code)] = code
             # Restore the complete device coverage and compile-time system
             # requirements recorded by the artifact. Written last so a failed
             # load cannot leak them into a cold-cache fallback on this object.
-            self._device_types = set(
-                getattr(dynamo, "device_types", None) or (dynamo.device_type,)
-            )
-            self._system_info = dynamo.system_info
-            self._requires_native_backend_compatibility = getattr(
-                dynamo, "requires_native_backend_compatibility", True
+            self._device_types = set(entry.device_types or (entry.device_type,))
+            self._system_info = entry.system_info
+            self._requires_native_backend_compatibility = (
+                entry.requires_native_backend_compatibility
             )
         else:
             module_name = (
@@ -1356,16 +1333,6 @@ class CompilePackage:
         for backend_id in _backend_ids_from_code(dynamo_code):
             self._add_backend_id(backend_id)
 
-    def add_inlined_source(self, sources: list[types.CodeType]) -> None:
-        if self._current_entry is None:
-            raise AssertionError("_current_entry is not set in add_inlined_source")
-        if self._current_entry.bypassed:
-            return
-        for code in sources:
-            if code in self._resume_codes:
-                continue
-            self._source_info.add_code(code)
-
     def discard_variant_backends(self, dynamo_code: types.CodeType) -> None:
         """Forget the backends of a variant that is not being recorded.
         OutputGraph registers them as it compiles, before the guards are built
@@ -1378,6 +1345,16 @@ class CompilePackage:
             if backend_id in self._current_entry.backend_ids:
                 self._current_entry.backend_ids.remove(backend_id)
             self._cached_backends.pop(backend_id, None)
+
+    def add_inlined_source(self, sources: list[types.CodeType]) -> None:
+        if self._current_entry is None:
+            raise AssertionError("_current_entry is not set in add_inlined_source")
+        if self._current_entry.bypassed:
+            return
+        for code in sources:
+            if code in self._resume_codes:
+                continue
+            self._source_info.add_code(code)
 
     def update_device_type(self, graph: torch.fx.Graph | None) -> bool:
         """
@@ -1963,6 +1940,9 @@ class CompilePackage:
                     ):
                         _, separator, suffix = builtin_dict_name.rpartition("_")
                         if separator and suffix.isdigit():
+                            # Process-global side effect: every install bumps
+                            # unique_id() past this suffix so a later compile
+                            # cannot mint the same name.
                             _reserve_unique_id_through(int(suffix))
                         # A pre-reset compile's CleanupHook may still own this
                         # name even when we're about to leave its value alone

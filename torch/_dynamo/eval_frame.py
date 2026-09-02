@@ -1187,9 +1187,15 @@ class _TorchDynamoContext:
                                 result.backends,
                                 isolate_recompiles_id=self._isolate_recompiles_id,
                             )
-                        except RuntimeError:
+                        except Exception as e:
+                            # initialize()/install() also raise KeyError (sys.modules),
+                            # AttributeError (_lookup_code) and ModuleNotFoundError
+                            # on a stale artifact; every one of them means "compile
+                            # cold", not "fail the user's call".
                             log.warning(
-                                "Failed to load entry from dynamo cache", exc_info=True
+                                "Failed to load entry from dynamo cache (%s); compiling from scratch",
+                                type(e).__name__,
+                                exc_info=True,
                             )
                             if self._package.is_initialized():
                                 self._package.reset_after_failed_install()

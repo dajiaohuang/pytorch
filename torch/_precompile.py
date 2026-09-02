@@ -449,6 +449,17 @@ class PrecompiledCallable:
         return self._compiled._package
 
 
+def _serve_parameters(serve: Callable[..., object]) -> frozenset[str]:
+    """An artifact carries its driver frozen, so a _serve emitted before this
+    took a prepared package has to keep working."""
+    import inspect
+
+    try:
+        return frozenset(inspect.signature(serve).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
 class _InstalledArtifact:
     """Handle for a multi-graph artifact that serves by installing.
 
@@ -475,6 +486,7 @@ class _InstalledArtifact:
         self._fn: Callable[..., object] | None = None
         self._inner: Any = None
         self._unloaded = False
+        self._prepared: Any = None
 
     def _rebind(self, fn: Callable[..., object]) -> None:
         if self._inner is not None:
@@ -484,10 +496,36 @@ class _InstalledArtifact:
             )
         self._fn = fn
 
+    def _prepare(self, package_blob: str) -> None:
+        """Build what serving needs, at load rather than at the first call."""
+        import base64
+
+        from torch._dynamo.precompile_package import prepare_cache_entry
+
+        # Exactly the resolution _ensure performs, or this prepares a different
+        # entry frame than the install will use.
+        fn = self._entry_factory() if self._fn is None else self._fn
+        try:
+            self._prepared = prepare_cache_entry(
+                fn, pickle.loads(base64.b64decode(package_blob))
+            )
+        except PrecompileError:
+            raise
+        except Exception as e:
+            raise PrecompileError(str(e)) from e
+
     def _ensure(self) -> Any:
         if self._inner is None:
             fn = self._entry_factory() if self._fn is None else self._fn
-            self._inner = self._serve(fn)
+            # An artifact emitted before _serve took a prepared package still
+            # serves; it just rebuilds what _prepare already built.
+            if self._prepared is not None and "prepared" in _serve_parameters(
+                self._serve
+            ):
+                self._inner = self._serve(fn, prepared=self._prepared)
+            else:
+                self._inner = self._serve(fn)
+            self._prepared = None
         return self._inner
 
     def __call__(self, *args: object, **kwargs: object) -> object:
@@ -1923,6 +1961,19 @@ def _build_multigraph_python_source(
 
     parts.append('SERVING_MODE = "standalone"')
     parts.append("")
+    parts.append("# Every function Dynamo INLINED into a captured graph, so the driver")
+    parts.append("# can tell that the source it is about to trust still says what it")
+    parts.append("# said at capture. The installed mode gets this from CompilePackage;")
+    parts.append(
+        "# a standalone artifact builds no package, so it carries the records."
+    )
+    parts.append("# __main__ is skipped: it names the LOADER's script on another")
+    parts.append("# machine, which is exactly what a portable artifact is for.")
+    parts.append(
+        f"INLINED_SOURCES = "
+        f"{sorted((s.module, s.firstlineno, s.lastlineno, s.checksum) for s in entry.source_info.inlined_sources if s.module != '__main__')!r}"
+    )
+    parts.append("")
     parts.append("# The entry's defaults and closure values: a code object carries")
     parts.append("# neither, and the driver rebuilds the entry from one.")
     parts.append(f"_ENTRY_BINDING = {_b64(entry_binding or {})!r}")
@@ -3214,6 +3265,7 @@ class _PrecompileApi:
                 )
             if fn is not None:
                 forward._rebind(fn)
+            forward._prepare(cast(str, meta["_PACKAGE"]))
             return PrecompiledCallable(forward)
         return PrecompiledModule._from_loaded(forward, backend=backend, tracer=tracer)
 

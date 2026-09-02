@@ -232,6 +232,65 @@ def _identity(x: Any) -> Any:
     return x
 
 
+@functools.cache
+def _warn_replayed_custom_function_view(idx: int) -> None:
+    # Once per process and input (the cache, not warnings' registry: each
+    # codegen'd epilogue is a fresh fabricated frame, so the registry would
+    # re-warn per compiled function). Tests reset it with .cache_clear().
+    warnings.warn(
+        f"torch.compile is writing mutated input {idx} back onto a view created "
+        "inside a custom autograd.Function (or an input it returned as-is) "
+        "without autograd tracking. Eager rejects an autograd-visible in-place "
+        "op on such a view; compile cannot tell that apart from a write that "
+        "bypasses autograd (e.g. through .data), so it replays the mutation "
+        "invisibly and gradients that later flow through this input see its "
+        "pre-mutation history only."
+    )
+
+
+def _replay_input_mutation(orig: torch.Tensor, updated: torch.Tensor, idx: int) -> None:
+    """Write a functionalized input mutation back onto the caller's tensor.
+
+    Normally a tracked ``copy_``. The exception is a view stamped
+    ``CreationMeta.IN_CUSTOM_FUNCTION`` -- what an input returned as-is by a
+    custom autograd.Function becomes -- which refuses any tracked in-place
+    edit. For that target the write is replayed invisibly: under ``no_grad``
+    with the version counter preserved, i.e. the way an op that writes through
+    raw pointers or ``.data`` (FBGEMM's fused-optimizer kernels, the motivating
+    case) actually did it in eager, where nothing raised.
+
+    This deliberately diverges from eager. Eager raises on an autograd-VISIBLE
+    in-place op to such a view; compile cannot tell a ``.data`` write from a
+    visible one at the region boundary (both functionalize to the same
+    ``mutates_data`` metadata), so it replays either kind invisibly and warns
+    once per process. A later use of the view then differentiates through its
+    pre-mutation history: the custom Function's backward runs, but on the
+    gradient of the post-mutation values with no contribution from the
+    mutating op. Clearing CreationMeta to force a tracked copy through instead
+    would reroute the base's history and silently drop the custom Function's
+    backward entirely.
+
+    Decided per call rather than baked into the epilogue because nothing
+    guards it -- a graph traced against an ordinary tensor can be handed such
+    a view later, which for a serialized artifact means a different process.
+    Exactly IN_CUSTOM_FUNCTION, not merely "not DEFAULT": a view made under
+    no_grad or inference mode, or a multi-output-node view, still takes a
+    tracked copy_ so autograd's version check can catch a genuinely stale use.
+    """
+    # pybind11 hands back a fresh enum object each call, so this cannot be `is`.
+    if (
+        orig._is_view()
+        and torch._C._autograd._get_creation_meta(orig)
+        == torch._C._autograd.CreationMeta.IN_CUSTOM_FUNCTION
+    ):
+        if torch.is_grad_enabled() and orig.requires_grad:
+            _warn_replayed_custom_function_view(idx)
+        with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(orig):
+            orig.copy_(updated)
+    else:
+        orig.copy_(updated)
+
+
 class AliasOfInputHandler:
     def __init__(
         self,
@@ -794,7 +853,9 @@ class _RuntimeForwardEpilogue:
                             "Mutations on inputs with user-specified streams are not yet supported. "
                             "See: https://github.com/pytorch/pytorch/issues/172522"
                         )
-                    original_inpt.copy_(updated_inpt)
+                    # Keep in sync with the codegen'd epilogue, which emits
+                    # _replay_input_mutation here (see finalize()).
+                    _replay_input_mutation(original_inpt, updated_inpt, inpt_idx)
 
     def _replay_output_aliases(
         self, orig_inputs: dict[int, Tensor], fw_outs: list[Any]
@@ -1083,7 +1144,11 @@ def _create_runtime_wrapper(
             args="orig_inputs, updated_inputs",
             artifact_name="mutation_epilogue",
         )
-        buf.bind(torch=torch, _unwrap_tensoralias=_unwrap_tensoralias)
+        buf.bind(
+            torch=torch,
+            _unwrap_tensoralias=_unwrap_tensoralias,
+            _replay_input_mutation=_replay_input_mutation,
+        )
         wrote_body = False
         with buf.indent():
             for i, inpt_idx in enumerate(runtime_metadata.mutated_inp_runtime_indices):
@@ -1139,7 +1204,9 @@ def _create_runtime_wrapper(
                             )
                             buf.writeline(f"raise RuntimeError({msg_name})")
                         else:
-                            buf.writeline(f"{oi}.copy_({ui})")
+                            buf.writeline(
+                                f"_replay_input_mutation({oi}, {ui}, {inpt_idx})"
+                            )
             if not wrote_body:
                 buf.writeline("pass")
 

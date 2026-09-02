@@ -169,7 +169,7 @@ _ALLOW_EMPTY_GRAPHS = torch._dynamo.config._make_closure_patcher(
 )
 
 
-_CAPTURE_CONFIG_STATE: ContextVar[tuple[int, tuple[bool, bool, bool] | None]] = (
+_CAPTURE_CONFIG_STATE: ContextVar[tuple[int, tuple[bool, bool, bool, bool] | None]] = (
     ContextVar("precompile_capture_config_state", default=(0, None))
 )
 
@@ -196,8 +196,19 @@ def _capture_config(training: bool = False) -> Iterator[None]:
             functorch_config.bundled_autograd_cache,
             dynamo_config.allow_empty_graphs,
             functorch_config.force_non_lazy_backward_lowering,
+            functorch_config.bypass_autograd_cache_key,
         )
         functorch_config.bundled_autograd_cache = True
+        # AOTAutogradCache refuses to KEY a graph it cannot address soundly --
+        # a graph calling anything outside its allowlist -- and a refusal means
+        # it never saves, which means the bundled artifact precompile needs is
+        # never recorded and the capture ends with nothing to serialize. That
+        # gate asks "is this key enough to tell this graph's behaviour apart
+        # from another's", which a precompile artifact does not depend on: it
+        # is addressed by backend id and pinned to one torch build. So fall
+        # back to a nonce key rather than declining, as torch._dynamo.aot_compile
+        # and aot_compile_joint_with_descriptors already do.
+        functorch_config.bypass_autograd_cache_key = True
         # Keeps an empty graph as a compiled frame so its guards reach the
         # artifact. Note it also extends the lifetime of objects the frame
         # holds: with it on, a weakref callback on a value the frame captured
@@ -223,6 +234,7 @@ def _capture_config(training: bool = False) -> Iterator[None]:
             functorch_config.bundled_autograd_cache = prior[0]
             dynamo_config.allow_empty_graphs = prior[1]
             functorch_config.force_non_lazy_backward_lowering = prior[2]
+            functorch_config.bypass_autograd_cache_key = prior[3]
             _CAPTURE_CONFIG_STATE.set((0, None))
         else:
             _CAPTURE_CONFIG_STATE.set((depth, prior))
@@ -1365,11 +1377,158 @@ _VALIDATION_PASSES = 4
 
 
 def _autograd_cache_bypasses() -> int:
-    """How many graphs AOTAutogradCache declined. Nonzero means the artifact is
-    empty because the cache refused the graph, not because of the grad mode."""
+    """How many graphs AOTAutogradCache declined.
+
+    Capture pins bypass_autograd_cache_key, so this no longer counts graphs the
+    cache refused to RECORD -- rendering re-enters AOTAutograd outside that
+    config and bypasses there routinely. It is a diagnostic, not a diagnosis.
+    """
     from torch._dynamo.utils import counters
 
     return counters["aot_autograd"].get("autograd_cache_bypass", 0)
+
+
+def _missing_backends_message(
+    total: int, missing: Sequence[object], backend: str = "inductor"
+) -> str:
+    """Why some compiled subgraphs never reached the artifact.
+
+    Reports the recorded/total split rather than asserting nothing was
+    recorded: a single missing id is fatal here, and saying so as "never
+    recorded" reads as total failure when most of the capture succeeded.
+    """
+    shown = ", ".join(str(b) for b in missing[:8])
+    if len(missing) > 8:
+        shown += f", ... ({len(missing) - 8} more)"
+    if backend not in ("inductor", "eager"):
+        # A session takes any backend Dynamo can resolve, but only these two
+        # leave something a served artifact can run: "eager" keeps the fx
+        # graphs and "inductor" bundles compiled code. Anything else captures
+        # cleanly and records nothing, so say so here rather than let it read
+        # as a defect in the model. aot_eager is the one people reach for,
+        # since it is how you isolate AOTAutograd.
+        return (
+            f"Precompilation recorded {total - len(missing)} of {total} "
+            f"compiled backend(s) because backend={backend!r} does not produce "
+            f"anything serializable; precompile can record only 'inductor' or "
+            f"'eager'. To isolate AOTAutograd without inductor, use plain "
+            f"torch.compile(backend='aot_eager') -- that needs no precompile."
+        )
+    bypasses = _autograd_cache_bypasses()
+    bypass_note = (
+        f" It bypassed {bypasses} time(s) here, which rendering does for any "
+        "graph the cache cannot key, and which does not by itself explain a gap."
+        if bypasses
+        else ""
+    )
+    return (
+        f"Precompilation recorded {total - len(missing)} of {total} compiled "
+        f"backend(s), so {len(missing)} graph(s) would reach the artifact with "
+        f"no code behind them: {shown}. Capture pins functorch's "
+        "bypass_autograd_cache_key, so AOTAutograd keys every graph it lowers "
+        "and no longer declines to record one it cannot address."
+        + bypass_note
+        + " A gap therefore means a graph whose backward never compiled, which "
+        "is a forward-only capture with grad enabled. Pass training=True to "
+        "lower the backward eagerly (the joint trace synthesizes tangents, so "
+        "no loss is needed), capture under torch.no_grad() / "
+        "torch.inference_mode() for an inference artifact, or run .backward() "
+        "inside the capture block. Re-run with "
+        "TORCH_LOGS=+torch._functorch._aot_autograd to see each graph as it "
+        "lowers."
+    )
+
+
+def _identify_graph(gm: torch.fx.GraphModule) -> str:
+    """Name a graph well enough to find it, from inside a backend.
+
+    The module class alone does not: every graph a model produces reports the
+    same one, so a capture that recompiled nine graphs at serve time said
+    "GraphModule" nine times. The compile id keys tlparse, the backend id keys
+    the artifact, and the first node carrying a stack trace names the user line
+    -- including, for a continuation, the resume frame Dynamo minted for it,
+    which is the only thing that tells one break in a chain from another.
+    """
+    parts: list[str] = []
+    compile_id = torch._guards.CompileContext.current_compile_id()
+    if compile_id is not None:
+        parts.append(f"compile id {compile_id}")
+    backend_id = gm.meta.get("backend_id") or getattr(gm, "_backend_id", None)
+    if backend_id is not None:
+        parts.append(f"backend id {backend_id}")
+    for node in gm.graph.nodes:
+        if node.op not in ("placeholder", "output") and node.stack_trace:
+            first = node.stack_trace.strip().splitlines()[0].strip()
+            parts.append(f"first traced at {first}")
+            break
+    return f" Graph: {'; '.join(parts)}." if parts else ""
+
+
+def _warn_risky_drops(risky: Sequence[tuple[str, str]]) -> None:
+    """Report accepted risky drops, shape-bearing ones first.
+
+    A guard-type-ordered cut is severity blind, and on a large model that is
+    not cosmetic: a capture reporting 652 drops buried its one SEQUENCE_LENGTH
+    and three CONSTANT_MATCHes -- the only types that can bear on shape at all
+    -- behind 392 CLOSURE_MATCHes on function identities.
+
+    Type is as far as this can go. Whether a guarded VALUE can differ at serve
+    time is the question a reader actually has, and the type does not answer
+    it: on that same model all four turned out to be reached through a class or
+    function definition, so they were compile-time constants and no batch could
+    change them. Ordering by type puts the candidates where they can be seen;
+    it does not rank them.
+
+    Measured on stock models: torchvision resnet18 and mobilenet_v3 report
+    none, timm's ViT reports one (a re-exported torch._assert) and
+    transformers' Qwen2 reports 33, nearly all library internals no deployment
+    swaps.
+    """
+    by_type: dict[str, list[str]] = {}
+    for guard_type, name in sorted(risky):
+        by_type.setdefault(guard_type, []).append(name)
+
+    # Grouped rather than a flat cut, and capped PER TYPE: a flat list is
+    # dominated by whichever type happens to be most numerous, which is exactly
+    # how one SEQUENCE_LENGTH stayed invisible behind 26 CONSTANT_MATCHes that
+    # were themselves behind 392 CLOSURE_MATCHes.
+    def render(types: list[str], per_type: int) -> str:
+        parts = []
+        for t in types:
+            names = by_type[t]
+            shown = ", ".join(names[:per_type])
+            more = f", +{len(names) - per_type} more" if len(names) > per_type else ""
+            parts.append(f"{t} x{len(names)}: {shown}{more}")
+        return "; ".join(parts)
+
+    shape_types = [t for t in by_type if t in _SHAPE_BEARING_GUARD_TYPES]
+    other_types = [t for t in by_type if t not in _SHAPE_BEARING_GUARD_TYPES]
+    # Says "could" rather than "can", and points at the distinction that
+    # actually decides it. This is a classification by guard TYPE, and the
+    # question a reader has is whether the guarded VALUE can differ at serve
+    # time -- which the type does not answer. The first four this ordering
+    # surfaced on a real model were all reached through a class or function
+    # definition (__mro__ walks to __defaults__, __code__) and were therefore
+    # compile-time constants that no batch could change. Distinguishing those
+    # properly needs the structured source, not the name.
+    shape_report = (
+        f" COULD BEAR ON SHAPE ({sum(len(by_type[t]) for t in shape_types)}), "
+        f"unlike the rest, so check these first -- but check whether each one "
+        f"can actually differ at serve time: a guard reached through a class or "
+        f"function definition (an __mro__ walk, __defaults__, __code__) is a "
+        f"compile-time constant and cannot: {render(shape_types, 3)}."
+        if shape_types
+        else ""
+    )
+    log.warning(
+        "precompile: %d dropped guard(s) can affect dispatch, so nothing checks "
+        "them at load.%s The rest are identity slots to audit: %s. "
+        "summary().risky_dropped_guards has all of them; this warning appears "
+        "only because require_no_risky_drops=False explicitly accepted them.",
+        len(risky),
+        shape_report,
+        render(other_types, 2) or "none",
+    )
 
 
 def _grad_snapshot(
@@ -1528,6 +1687,12 @@ class PrecompileSession:
         # The grad mode each variant compiled under; the artifact dispatches
         # under it, since GRAD_MODE is a guard a call in the other mode misses.
         self._compile_grad_modes: set[bool] = set()
+        # Retain what each example call returned, for precompile()'s on-disk
+        # form to hand back. Off by default: a capture() session outlives the
+        # calls, and holding every result would pin the caller's output tensors
+        # for the life of the session.
+        self._collect_results = False
+        self._example_results: list[object] = []
         # The leaves every live guard build produced, to compare a rebuild
         # against; see _report_guard_drift.
         self._live_guard_leaves: set[tuple[str, str]] = set()
@@ -1750,10 +1915,12 @@ class PrecompileSession:
                     # AOTAutograd builds its CompiledFunction and the joint
                     # graph, which it only does when the outputs require grad.
                     with torch.inference_mode(False), torch.enable_grad():
-                        self._call(*args, **kwargs)
+                        result = self._call(*args, **kwargs)
                 else:
                     with torch.inference_mode(False), torch.no_grad():
-                        self._call(*args, **kwargs)
+                        result = self._call(*args, **kwargs)
+                if self._collect_results:
+                    self._example_results.append(result)
         except BaseException as e:
             self._record_capture_error(e)
             # A __enter__ that raises never gets its __exit__, so without this
@@ -2191,6 +2358,16 @@ class PrecompileSession:
         modes = self._compile_grad_modes
         return next(iter(modes)) if len(modes) == 1 else None
 
+    def example_results(self) -> list[object]:
+        """
+        What each ``example_inputs`` call returned, in order.
+
+        Only populated when ``_collect_results`` was set before ``__enter__``;
+        otherwise empty, because a session that outlives its calls must not pin
+        the caller's output tensors.
+        """
+        return list(self._example_results)
+
     def invariants(self) -> tuple[FrameInvariants, ...]:
         """
         Per frame, the guards that held in EVERY compiled variant of it.
@@ -2392,10 +2569,7 @@ class PrecompileSession:
                 f"require_no_risky_drops=False to accept the risk explicitly."
             )
         elif summary.risky_dropped_guards:
-            # The caller explicitly accepted the risk. Measured on stock models: torchvision
-            # resnet18 and mobilenet_v3 report none, timm's ViT reports one (a
-            # re-exported torch._assert) and transformers' Qwen2 reports 33,
-            # nearly all of them library internals that no deployment swaps.
+            # The caller explicitly accepted the risk.
             _warn_risky_drops(summary.risky_dropped_guards)
         if require_complete:
             if summary.guarded_codes == 0:
@@ -2501,10 +2675,7 @@ class PrecompileSession:
                 f"require_no_risky_drops=False to accept the risk explicitly."
             )
         elif summary.risky_dropped_guards:
-            # The caller explicitly accepted the risk. Measured on stock models: torchvision
-            # resnet18 and mobilenet_v3 report none, timm's ViT reports one (a
-            # re-exported torch._assert) and transformers' Qwen2 reports 33,
-            # nearly all of them library internals that no deployment swaps.
+            # The caller explicitly accepted the risk.
             _warn_risky_drops(summary.risky_dropped_guards)
         if require_complete:
             if summary.guarded_codes == 0:
@@ -2991,12 +3162,13 @@ class InstalledCallable:
         compiled: Callable[..., object],
         package: CompilePackage,
         isolate_recompiles_id: int,
-        backend: "_PrecompileBackend | None" = None,
+        backend: _PrecompileBackend | None = None,
     ) -> None:
         self._compiled: Callable[..., object] | None = compiled
         self._backend = backend
         self._package = package
         self._isolate_recompiles_id = isolate_recompiles_id
+        self._backend = backend
         from .pgo import _new_code_state
 
         self._pgo_state = _new_code_state()
@@ -3052,6 +3224,16 @@ class InstalledCallable:
                 self._active_calls -= 1
                 if self._active_calls == 0:
                     self._state.notify_all()
+
+    def serve_time_compiles(self) -> int:
+        """Graphs this artifact compiled while SERVING, rather than serving.
+
+        Zero is the number that says the artifact covered every call it saw.
+        An installed artifact answers a guard miss by compiling, so this
+        climbing means it is serving less of itself than it was measured to --
+        the right thing to gate a job on.
+        """
+        return self._backend.serve_time_compiles if self._backend else 0
 
     def __enter__(self) -> Self:
         with self._state:

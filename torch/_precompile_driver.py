@@ -415,19 +415,6 @@ def _inductor_forward(*args):
     return _pytree.tree_unflatten(out, _pytree.treespec_loads(OUT_SPEC))
 
 
-def _rebuild_cell(value):
-    # Rebuild a closure cell holding ``value``: Python exposes no public cell
-    # constructor, so close over ``value`` in a throwaway function and steal its cell.
-    # Mirrors torch._dynamo.aot_compile.AOTCompilePickler._unpickle_cell; used to
-    # restore the transformed bytecode's free variables from their captured contents.
-    def _inner():
-        return value
-
-    if _inner.__closure__ is None:
-        raise AssertionError("closure must not be None")
-    return _inner.__closure__[0]
-
-
 def _build_multigraph_forward():
     """Reconstruct a multi-graph artifact and return the runnable ``forward``.
 
